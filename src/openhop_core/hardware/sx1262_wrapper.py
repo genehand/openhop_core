@@ -62,6 +62,10 @@ class SX1262Radio(LoRaRadio):
     REG_RX_SENSITIVITY = 0x08B5
     REG_RX_SENSITIVITY_BIT0 = 0x01
 
+    # A front-end LNA gain worth more than this is much more likely to be a
+    # units or sign mistake than a real module, so it is worth a warning.
+    RSSI_OFFSET_MAX_ABS_DB = 40.0
+
     def __init__(
         self,
         bus_id: int = 0,
@@ -93,6 +97,7 @@ class SX1262Radio(LoRaRadio):
         lbt_retry_interval_ms: int = 200,
         radio_timing_delay: float = RADIO_TIMING_DELAY,
         lbt_enabled: bool = True,
+        rssi_offset_db: float = 0.0,
         spi_transport=None,
         gpio_manager=None,
     ):
@@ -126,6 +131,13 @@ class SX1262Radio(LoRaRadio):
             dio3_tcxo_voltage: TCXO reference voltage in volts (default: 1.8)
             use_dio2_rf: Enable DIO2 as RF switch control (default: False)
             radio_timing_delay: Delay used for radio state transitions (default: 10ms)
+            rssi_offset_db: Signed correction added to every RSSI and noise-floor
+                reading, so reported levels are antenna-referred instead of
+                chip-referred. Modules with a front-end LNA ahead of the SX1262
+                (e.g. the E22P-915M30S) report every level high by the LNA gain,
+                so they want a negative value -- roughly the gain, e.g. -17.0.
+                SNR is never corrected: it is already gain-invariant.
+                Apply the offset to both RSSI and the noise floor or to neither.
             spi_transport: Optional per-instance SPI transport (e.g. CH341SPITransport)
             gpio_manager: Optional per-instance GPIO manager (e.g. CH341GPIOManager)
         """
@@ -162,6 +174,15 @@ class SX1262Radio(LoRaRadio):
         self.use_dio3_tcxo = use_dio3_tcxo
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
         self.use_dio2_rf = use_dio2_rf
+        # Signed correction applied to every reported RSSI / noise-floor level.
+        # See set_rssi_offset_db() for the runtime setter.
+        self.rssi_offset_db = float(rssi_offset_db or 0.0)
+        if abs(self.rssi_offset_db) > self.RSSI_OFFSET_MAX_ABS_DB:
+            logger.warning(
+                "Front-end RSSI offset of %.1f dB is implausibly large; expected "
+                "roughly the LNA gain (e.g. -17.0 dB for an E22P-915M30S).",
+                self.rssi_offset_db,
+            )
 
         # State variables
         self.lora: Optional[SX126x] = None
@@ -621,7 +642,7 @@ class SX1262Radio(LoRaRadio):
                                             packet_rssi_dbm,
                                             snr_db,
                                             signal_rssi_dbm,
-                                        ) = self.lora.getSignalMetrics()
+                                        ) = self._apply_metrics_offset(self.lora.getSignalMetrics())
                                         (
                                             payloadLengthRx,
                                             rxStartBufferPointer,
@@ -677,7 +698,7 @@ class SX1262Radio(LoRaRadio):
                                         packet_rssi_dbm,
                                         snr_db,
                                         signal_rssi_dbm,
-                                    ) = self.lora.getSignalMetrics()
+                                    ) = self._apply_metrics_offset(self.lora.getSignalMetrics())
                                     self.last_rssi = int(packet_rssi_dbm)
                                     self.last_snr = snr_db
                                     self.last_signal_rssi = int(signal_rssi_dbm)
@@ -1566,6 +1587,51 @@ class SX1262Radio(LoRaRadio):
         """Return last received signal RSSI in dBm"""
         return self.last_signal_rssi
 
+    def _apply_rssi_offset(self, dbm: float) -> float:
+        """Return a chip-reported level as an antenna-referred level in dBm.
+
+        The SX1262 measures at its own pins, so a front-end LNA between the
+        antenna and the chip lifts every reading by the LNA gain -- signal and
+        noise alike. Subtracting that gain puts the numbers back on the antenna
+        reference, where a LoRa noise floor reads about -174 + 10*log10(BW) + NF.
+
+        Applies to RSSI and noise floor only. SNR is gain-invariant and is left
+        untouched, which is why demodulation and link-margin decisions do not
+        depend on this correction.
+        """
+        if not self.rssi_offset_db:
+            return dbm
+        return float(dbm) + self.rssi_offset_db
+
+    def _apply_metrics_offset(self, metrics: tuple) -> tuple:
+        """Re-reference a getSignalMetrics() tuple; SNR is left as reported."""
+        packet_rssi_dbm, snr_db, signal_rssi_dbm = metrics
+        return (
+            self._apply_rssi_offset(packet_rssi_dbm),
+            snr_db,
+            self._apply_rssi_offset(signal_rssi_dbm),
+        )
+
+    def set_rssi_offset_db(self, offset_db: float) -> None:
+        """Change the front-end RSSI offset and re-reference sampled floors.
+
+        Already-averaged noise-floor samples are shifted by the delta so the
+        reported floor stays continuous instead of jumping on the next sample.
+        """
+        new_offset = float(offset_db or 0.0)
+        delta = new_offset - self.rssi_offset_db
+        self.rssi_offset_db = new_offset
+        if not delta:
+            return
+        if self._noise_floor_samples:
+            self._noise_floor_samples = [s + delta for s in self._noise_floor_samples]
+            self._floor_sample_sum = sum(self._noise_floor_samples)
+            self._noise_floor = self._floor_sample_sum / len(self._noise_floor_samples)
+        logger.info(
+            "Front-end RSSI offset set to %+.1f dB (levels are now antenna-referred)",
+            self.rssi_offset_db,
+        )
+
     def _sample_noise_floor(self) -> None:
         """Sample noise floor"""
         if not self._initialized or self.lora is None:
@@ -1610,9 +1676,18 @@ class SX1262Radio(LoRaRadio):
                 logger.debug("[Noise] Sample rejected: RSSI read returned None")
                 return
 
-            current_rssi = -(float(raw_rssi) / 2.0)
-            if not (-127.5 <= current_rssi < 0.0):
-                logger.debug("[Noise] Sample rejected: out-of-range RSSI %.1f dBm", current_rssi)
+            # The chip reports post-front-end, so validate the raw reading before
+            # any antenna-referred correction is applied to it.
+            raw_rssi_dbm = -(float(raw_rssi) / 2.0)
+            if not (-127.5 <= raw_rssi_dbm < 0.0):
+                logger.debug("[Noise] Sample rejected: out-of-range RSSI %.1f dBm", raw_rssi_dbm)
+                return
+
+            current_rssi = self._apply_rssi_offset(raw_rssi_dbm)
+            if not current_rssi < 0.0:
+                logger.debug(
+                    "[Noise] Sample rejected: offset RSSI %.1f dBm is not a level", current_rssi
+                )
                 return
 
             self._noise_floor_samples.append(current_rssi)
@@ -1918,6 +1993,9 @@ class SX1262Radio(LoRaRadio):
             "last_rssi": self.last_rssi,
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
+            # So a dashboard showing an unusually flat-looking floor can tell
+            # whether it is already antenna-referred or still chip-referred.
+            "rssi_offset_db": self.rssi_offset_db,
             "crc_error_count": self.crc_error_count,
         }
 
@@ -2312,7 +2390,9 @@ class SX1262Radio(LoRaRadio):
         status readers keep reporting the configured mesh frequency throughout.
 
         Readings >= -1 dBm or <= -126 dBm are unsettled front-end or bus noise
-        and are counted in `discarded` rather than returned.
+        and are counted in `discarded` rather than returned. Those bounds are
+        checked on the raw chip reading, before any front-end RSSI offset is
+        applied, because they describe the ADC rather than the antenna.
 
         Returns:
             dict: {"freq_hz", "dwell_s", "started_ts", "n", "samples", "discarded"}
@@ -2372,7 +2452,9 @@ class SX1262Radio(LoRaRadio):
                     if value >= -1.0 or value <= -126.0:
                         discarded += 1
                     else:
-                        samples.append(value)
+                        # Same antenna reference as the noise floor, so a sweep
+                        # and the floor chart plot on one axis.
+                        samples.append(self._apply_rssi_offset(value))
                 await asyncio.sleep(max(0.0, float(sample_gap_s)))
 
             return {

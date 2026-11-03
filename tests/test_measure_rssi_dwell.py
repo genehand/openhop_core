@@ -56,14 +56,16 @@ def _reset_singleton():
     SX1262Radio._active_instance = None
 
 
-async def _make_radio(rssi_raw_values=()):
+async def _make_radio(rssi_raw_values=(), rssi_offset_db=0.0):
     with (
         patch("openhop_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=MagicMock()),
         patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
     ):
         from openhop_core.hardware.sx1262_wrapper import SX1262Radio
 
-        radio = SX1262Radio(radio_timing_delay=0.0, frequency=MESH_FREQ)
+        radio = SX1262Radio(
+            radio_timing_delay=0.0, frequency=MESH_FREQ, rssi_offset_db=rssi_offset_db
+        )
     radio.lora = _make_mock_lora(rssi_raw_values)
     radio._initialized = True
     radio._interrupt_setup = True
@@ -185,3 +187,29 @@ async def test_dwell_requires_an_initialised_radio():
     radio._initialized = False
     with pytest.raises(RuntimeError, match="not initialized"):
         await radio.measure_rssi_dwell(SWEEP_FREQ, dwell_s=0.001)
+
+
+async def test_dwell_samples_carry_the_front_end_offset():
+    # Same sweep on an LNA board: the samples are antenna-referred, so they
+    # plot on one axis with the reported noise floor.
+    radio = await _make_radio([200, 180], rssi_offset_db=-17.0)
+
+    result = await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.02, sample_gap_s=0.0, settle_s=0.0
+    )
+
+    assert result["samples"][:2] == [-117.0, -107.0]
+
+
+async def test_dwell_settling_bounds_stay_on_the_raw_reading():
+    # raw 1 -> -0.5 dBm is unsettled at the ADC, and a -17 dB offset must not
+    # launder it into a plausible antenna-level sample.
+    radio = await _make_radio(rssi_offset_db=-17.0)
+    radio.lora.getRssiInst.side_effect = lambda: 1  # -0.5 dBm: unsettled
+
+    result = await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.01, sample_gap_s=0.0, settle_s=0.0
+    )
+
+    assert result["samples"] == []
+    assert result["discarded"] >= 1
