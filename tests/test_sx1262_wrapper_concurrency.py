@@ -1298,6 +1298,103 @@ class TestNoiseFloorSampling:
 
 
 # ===========================================================================
+# 9b. Front-end RSSI offset (LNA-equipped modules)
+# ===========================================================================
+
+
+class TestFrontEndRssiOffset:
+    """A front-end LNA lifts every level the chip reports; the offset undoes it.
+
+    The E22P-915M30S puts an LNA ahead of the SX1262, so both the noise floor
+    and packet RSSI read high by the LNA gain while SNR is unaffected.
+    """
+
+    @staticmethod
+    def _radio_with_offset(mock_lora, mock_gpio, offset_db):
+        with (
+            patch(
+                "openhop_core.hardware.sx1262_wrapper.GPIOPinManager",
+                return_value=mock_gpio,
+            ),
+            patch("openhop_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            from openhop_core.hardware.sx1262_wrapper import SX1262Radio
+
+            r = SX1262Radio(radio_timing_delay=0.0, rssi_offset_db=offset_db)
+        r.lora = mock_lora
+        r._initialized = True
+        r._interrupt_setup = True
+        r._gpio_manager = mock_gpio
+        return r
+
+    def test_default_offset_is_a_no_op(self, radio, mock_lora):
+        assert radio.rssi_offset_db == 0.0
+        radio._last_sample_check = 0.0
+        radio._last_packet_activity = 0.0
+        mock_lora.getRssiInst.return_value = 200  # -100 dBm raw
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=400.0):
+            radio._sample_noise_floor()
+        assert radio.get_noise_floor() == pytest.approx(-100.0)
+
+    def test_noise_floor_absorbs_the_lna_gain(self, mock_lora, mock_gpio):
+        radio = self._radio_with_offset(mock_lora, mock_gpio, -17.0)
+        radio._last_sample_check = 0.0
+        radio._last_packet_activity = 0.0
+        mock_lora.getRssiInst.return_value = 166  # -83 dBm at the chip
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=400.0):
+            radio._sample_noise_floor()
+        # -83 dBm chip-referred is -100 dBm at the antenna.
+        assert radio._noise_floor_samples == [pytest.approx(-100.0)]
+        assert radio.get_noise_floor() == pytest.approx(-100.0)
+
+    def test_packet_metrics_shift_but_snr_does_not(self, radio):
+        radio.rssi_offset_db = -17.0
+        rssi, snr, signal_rssi = radio._apply_metrics_offset((-83.0, 5.0, -85.0))
+        assert rssi == pytest.approx(-100.0)
+        assert signal_rssi == pytest.approx(-102.0)
+        assert snr == 5.0  # gain-invariant, never corrected
+
+    def test_positive_offset_supports_a_front_end_attenuator(self, mock_lora, mock_gpio):
+        radio = self._radio_with_offset(mock_lora, mock_gpio, 2.0)
+        assert radio._apply_rssi_offset(-100.0) == pytest.approx(-98.0)
+
+    def test_offset_cannot_push_a_reading_to_zero(self, mock_lora, mock_gpio):
+        # A raw 0 is the chip's "no reading" value; -raw/2 is -0.0 and is
+        # rejected before the offset can make it look like a plausible floor.
+        radio = self._radio_with_offset(mock_lora, mock_gpio, -17.0)
+        radio._last_sample_check = 0.0
+        mock_lora.getRssiInst.return_value = 0
+        with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=400.0):
+            radio._sample_noise_floor()
+        assert radio._noise_floor_samples == []
+        assert radio.get_noise_floor() is None
+
+    def test_setter_re_references_sampled_floors(self, mock_lora, mock_gpio):
+        radio = self._radio_with_offset(mock_lora, mock_gpio, 0.0)
+        radio._noise_floor_samples = [-118.0, -120.0]
+        radio._num_floor_samples = 2
+        radio._floor_sample_sum = -238.0
+        radio._noise_floor = -119.0
+
+        radio.set_rssi_offset_db(-17.0)
+
+        assert radio._noise_floor_samples == [pytest.approx(-135.0), pytest.approx(-137.0)]
+        assert radio.get_noise_floor() == pytest.approx(-136.0)
+
+    def test_setter_without_samples_only_records_the_offset(self, radio):
+        radio.set_rssi_offset_db(-17.0)
+        assert radio.rssi_offset_db == -17.0
+        assert radio._num_floor_samples == 0
+        assert radio.get_noise_floor() is None
+
+    def test_implausible_offset_warns(self, mock_lora, mock_gpio, caplog):
+        with caplog.at_level("WARNING"):
+            radio = self._radio_with_offset(mock_lora, mock_gpio, 90.0)
+        assert radio.rssi_offset_db == 90.0
+        assert "implausibly large" in caplog.text
+
+
+# ===========================================================================
 # 10. TX airtime calculation
 # ===========================================================================
 
